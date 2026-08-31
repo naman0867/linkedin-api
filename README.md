@@ -1,182 +1,532 @@
-# Recovery Console
+# LinkedIn Profile API
 
-An agent that decides how to recover each failed payment, and a console that shows the money it brought back.
+An HTTP API that accepts a LinkedIn member profile URL and returns the profile as
+structured JSON. Authentication and data retrieval are both reverse-engineered
+against LinkedIn's private endpoints — no browser, no headless driver, no
+official API, no third-party data provider.
 
-Built for **Track 3 — AI Revenue Recovery**.
-
----
-
-## The problem
-
-A meaningful share of Indian online payments fail on the first attempt — bank downtime, UPI collect timeouts, expired mandates, issuer declines. Most merchants respond with a single blanket retry on a fixed timer. That is cheap to build and it leaves money on the table, because it treats an issuer outage, a low balance, and a frozen account as the same event.
-
-They are not the same event. An outage wants a different rail. A low balance wants the customer. A frozen account wants nothing at all — every attempt spent on it is pure cost.
-
-This system classifies each failure into one of five recovery archetypes, picks an action, runs it past a guardrail layer, and reports the rupees recovered against a fixed-retry baseline.
-
----
-
-## Result
-
-50,000 failed payments over 14 simulated days, ₹10.3 crore at risk. Same payments, same ordering, same outcome seed in both arms — the only variable is the decision.
-
-|                        |      Baseline |         Agent |     Delta |
-| ---------------------- | ------------: | ------------: | --------: |
-| Recovery rate          |        25.96% |        48.75% | +22.79 pp |
-| **Value recovered**    | **₹2.33 Cr**  | **₹4.43 Cr**  | **+89.8%** |
-| Payments recovered     |        12,980 |        24,376 |   +11,396 |
-| Attempts spent         |        49,737 |        48,227 |    −1,510 |
-| Wasted attempts        |        36,757 |        23,851 |   −12,906 |
-| Attempt efficiency     |        26.10% |        50.54% | +24.45 pp |
-| p95 decision latency   |      0.005 ms |      0.019 ms |           |
-
-More money from **fewer** attempts. The lift is not "retry harder" — it is spending the same attempt budget on the failures that can actually be recovered.
-
-### Where the lift comes from
-
-Each capability removed in turn, everything else held constant:
-
-| Variant                       |   Recovered |   Rate | Wasted | vs full |
-| ----------------------------- | ----------: | -----: | -----: | ------: |
-| full agent                    | ₹4.43 Cr    | 48.8%  | 23,851 |       — |
-| − rail switching              | ₹3.30 Cr    | 38.1%  | 29,160 | −₹1.12 Cr |
-| − customer nudges             | ₹3.59 Cr    | 38.7%  | 28,878 | −₹83.7 L |
-| − issuer health               | ₹4.12 Cr    | 46.0%  | 25,241 | −₹31.0 L |
-| − unrecoverable suppression   | ₹4.49 Cr    | 49.0%  | 25,235 | **+₹6.7 L** |
-
-That last row is a real trade-off, not a win, and it is reported as one. Suppressing known-unrecoverable payments *costs* about ₹6.7 lakh in recovered value. It buys 1,384 fewer wasted attempts and, more importantly, no dunning messages sent to customers whose accounts are frozen or flagged for risk. Whether that trade is worth it is a policy decision for the merchant, not something the agent should quietly decide. The flag is exposed so it can be argued about.
-
----
-
-## Architecture
-
-```
-failed payment
-      │
-      ▼
-┌─────────────────────────────────────────────────────┐
-│ TRIAGE                                              │
-│   tier 1  rules      catalogued error codes  ~94%   │
-│   tier 2  model      free-text acquirer text  ~6%   │
-│           └─ falls back to keyword match on failure │
-└─────────────────────────────────────────────────────┘
-      │  archetype + confidence
-      ▼
-┌─────────────────────────────────────────────────────┐
-│ AGENT                                               │
-│   check_issuer_health    burst vs own baseline      │
-│   get_customer_history   reliability segment        │
-│   schedule_retry / draft_nudge                      │
-└─────────────────────────────────────────────────────┘
-      │  proposed action
-      ▼
-┌─────────────────────────────────────────────────────┐
-│ GUARDRAILS                                          │
-│   kill switch → idempotency → attempt caps          │
-│   → approval queue → audit log                      │
-└─────────────────────────────────────────────────────┘
-      │
-      ▼
- executed │ held for approval │ blocked   → all logged
-```
-
-### The five archetypes
-
-| Archetype            | Meaning                                             | Action              |
-| -------------------- | --------------------------------------------------- | ------------------- |
-| `RETRY_NOW`          | Transient, same rail will work                       | retry at +4 min     |
-| `RETRY_AFTER_WINDOW` | Rail degraded, wait for it to clear                  | retry at +25/45 min |
-| `SWITCH_RAIL`        | This rail keeps declining                            | re-present elsewhere |
-| `CUSTOMER_ACTION`    | Nothing works until the customer fixes something     | templated nudge     |
-| `UNRECOVERABLE`      | Do not spend another attempt                         | none                |
-
-### Why rules for most of it
-
-Tier 1 handles ~94% of traffic deterministically. It is free, instant, auditable, and a model would be worse on every one of those axes. The model earns its place only on uncatalogued acquirer strings, where there is no deterministic route. `evaluate.py` scores the tiers separately, so the model's contribution is a number rather than a claim — if tier 2 ever stops beating its keyword fallback, delete it.
-
-### Guardrails
-
-Five controls, in firing order:
-
-1. **Kill switch** — halts all outbound actions; decisions still get logged so you can see what it would have done.
-2. **Idempotency** — SHA-256 of `(payment_id, attempt, rail)`. A replayed decision collapses to one action.
-3. **Attempt caps** — 3 per payment, 4 actions per customer per day, enforced independently of what the agent asks for.
-4. **Approval queue** — anything above ₹25,000, or below the confidence floor, is held for a human.
-5. **Audit log** — every decision, its inputs, its tier, its reasoning and its guardrail verdict, appended immutably and exportable to JSONL.
-
-Nothing blocked is silently dropped. Every suppressed action leaves a record.
-
-**Message drafting is templated, not generated.** A model that invents an amount or a refund promise in a customer-facing payment message is a compliance problem, not a feature. Templates get reviewed once; generated text would need reviewing every time.
-
----
-
-## Running it
+**Live:** https://linkedin-profile-api-81m4.onrender.com/docs
+**Demo key:** `my-long-random-key-9f3k2j`
 
 ```bash
-pip install -r requirements.txt
-
-./run.sh quick      # 5k smoke run, ~2 seconds
-./run.sh eval       # full 50k evaluation + ablation study
-./run.sh console    # live console at http://127.0.0.1:8000
+curl -G https://linkedin-profile-api-81m4.onrender.com/v1/profile \
+  -H "X-API-Key: my-long-random-key-9f3k2j" \
+  --data-urlencode "url=https://www.linkedin.com/in/williamhgates/"
 ```
 
-Set `ANTHROPIC_API_KEY` to activate the tier-2 model classifier. Without it, the long-tail path runs on keyword fallback, and every report states which mode produced it.
-
-Outputs land in `data/`: `metrics.json`, `metrics.txt`, `audit_log.jsonl`.
-
-### The console
-
-* **Recovery waterfall** — at-risk value decomposed into recovered segments by decision type, with the baseline's recovery marked as a tick. The agent's bar visibly extends past it.
-* **Live failure feed** — click any row for the full decision chain: error, issuer state, tools called, reasoning, guardrail verdict, outcome.
-* **Issuer health** — every `(issuer, method)` pair as a multiple of its own baseline failure rate. Pairs below the event floor stay grey; colour is reserved for pairs the agent will act on.
-* **Approval queue** — approve or reject held actions, with the guardrail's reason attached.
-* **Audit log** — searchable by payment id, archetype, status or reasoning.
-* **Kill switch** — engage it and watch execution stop while logging continues.
+> **Free tier:** the first request may take ~60s while the instance wakes.
+>
+> **Please read [Current status](#current-status-linkedin-endpoint-migration) first.**
+> LinkedIn retired the profile endpoint this API was built against *during* the
+> assignment window. Authentication works and is verified; profile retrieval
+> currently returns a typed `UPSTREAM_ERROR` because the upstream returns
+> `410 Gone`. The investigation, evidence and migration path are documented below.
 
 ---
 
-## Honest limitations
+## Contents
 
-**The data is synthetic.** No real transaction data was available, so `generator.py` produces it from explicit assumptions. Distributions were chosen to be plausible, not measured. The two assumptions carrying the most weight on the headline number are `DOWNTIME_SHARE` (27% of failures occur inside an issuer outage window) and the per-code `base_retry_success` values in `error_codes.py`. Those are the first two things to validate against real traffic, and the result should be treated as directional until they are.
-
-**Outcomes are modelled, not observed.** `simulator.py` decides whether a retry succeeds using hidden parameters the agent never sees, which keeps the evaluation non-circular — the agent is scored on outcomes it could not observe when deciding. But it is still a model of reality, and its structure encodes beliefs about how payment recovery works.
-
-**Issuer health is inferred, not known.** In production nobody tells you "HDFC UPI is down" — you infer it from your own failure stream, late and noisily. The monitor reflects this: it reads only observed traffic, never the simulator's downtime ground truth, so it detects outages with a real lag. A version with access to a downtime feed would do better.
-
-**Detection uses a fixed window.** A 20-minute window with a 3× burst threshold is a reasonable starting point, not a tuned one. Low-volume `(issuer, method)` pairs need the event floor to avoid firing on noise, which means genuine outages on quiet rails go undetected for longer.
-
-**One attempt per payment is simulated.** The guardrails support up to three, and the audit log carries the attempt count, but the evaluation scores the first action only. Multi-attempt sequencing is the obvious next thing to build.
-
----
-
-## A bug worth documenting
-
-The first ablation run showed issuer health *losing* ₹2.7 lakh — removing the capability made the system better.
-
-The cause: on detecting an outage, the agent was downgrading `SWITCH_RAIL` decisions into `RETRY_AFTER_WINDOW` waits. But an outage is scoped to one `(issuer, method)` pair. Switching *away* from the broken rail is the correct response; queuing behind it is the worst possible one. The simulator had the same error mirrored — it applied the downtime penalty to rail-switched retries, which should have escaped it.
-
-Two fixes, one in each file. The capability went from −₹2.7 lakh to +₹31 lakh.
-
-Worth stating plainly: the ablation found this, not inspection. A single headline number would have hidden it completely, because the system still looked good overall while one of its four capabilities was actively destroying value.
+- [Current status](#current-status-linkedin-endpoint-migration)
+- [Scope and legal position](#scope-and-legal-position)
+- [Approach](#approach)
+- [Setup](#setup)
+- [API documentation](#api-documentation)
+- [Response schema](#response-schema)
+- [Known limitations](#known-limitations)
+- [Testing](#testing)
+- [Deployment](#deployment)
+- [What I would do next](#what-i-would-do-next)
 
 ---
 
-## Layout
+## Current status: LinkedIn endpoint migration
+
+I am documenting this prominently rather than burying it, because it is the most
+interesting thing I found and because a reviewer testing the live URL will hit it
+immediately.
+
+### What happened
+
+This API was built against `/voyager/api/identity/profiles/{id}/profileView`, the
+aggregate endpoint that has served LinkedIn profile data for years. On **31 August
+2026**, that endpoint returns `410 Gone` — not 403, not 404. `410` is the status a
+server sends when a resource has been *deliberately and permanently removed*. This
+is a deprecation, not a block on my session.
+
+### Evidence
+
+Verified with a valid, authenticated session (`/voyager/api/me` returns `200`
+throughout, so the session itself is sound):
+
+| Endpoint | Status |
+|---|---|
+| `identity/profiles/{id}/profileView` | **410 Gone** |
+| `identity/profiles/{id}` | **410 Gone** |
+| `me` | **200 OK** |
+| `identity/dash/profiles?q=memberIdentity&memberIdentity={id}` | **200 OK** |
+| `identity/dash/profiles?...&decorationId=...FullProfileWithEntities-{55..71}` | **302** (all 17 versions) |
+
+Reproducible via the probe scripts committed in `scripts/`:
+
+```bash
+python scripts/probe_endpoints.py williamhgates   # endpoint sweep
+python scripts/probe2.py williamhgates            # collection endpoints + queryId discovery
+```
+
+### What this means
+
+LinkedIn has moved from the legacy aggregate model to the **dash** model. Instead
+of one call returning a nested document with `positionView`, `educationView` and
+so on, the new design returns a normalized `{data, included}` graph, and each
+profile section is a separate collection endpoint keyed by the profile URN.
+
+The base `dash/profiles` call succeeds and returns the `Profile` entity. The
+section collections (`profilePositionGroups`, `profileEducations`,
+`profileSkills`, …) are the remaining piece. Probing them was cut short by
+LinkedIn soft rate limiting: after roughly 30 requests the profile endpoints began
+returning `302` redirects while `/me` continued to return `200`. I stopped rather
+than push through it — sustained probing against a rate limit is how an account
+gets restricted, and that seemed a worse outcome than an incomplete map.
+
+### What works today
+
+- Programmatic authentication against `/uas/authenticate` — verified, returns a
+  valid `li_at`
+- Session validation (`/me` → `200`)
+- The new base profile endpoint (`dash/profiles` → `200`)
+- URL parsing, response schema, caching, throttling, typed errors, 19 passing tests
+- Live HTTPS deployment
+
+### What does not
+
+- Full profile assembly. Requires mapping the dash collection endpoints, which is
+  the concrete next task described in [What I would do next](#what-i-would-do-next).
+
+I would rather submit an honest account of a live API migration than a scraper
+copied from a two-year-old tutorial that silently returns nothing.
+
+---
+
+## Scope and legal position
+
+Leading with this because it shaped the design.
+
+LinkedIn's User Agreement prohibits scraping and automated data collection. This
+project authenticates with a real member session, so it operates *inside* that
+agreement rather than outside it. *hiQ Labs v. LinkedIn* is often cited as
+establishing that scraping public data is lawful, but that ruling concerned the
+Computer Fraud and Abuse Act and unauthenticated access to public pages; on remand
+LinkedIn prevailed on breach of contract. Authenticated collection is a materially
+weaker position than the headline summary suggests.
+
+Profile data is also personal data. Under GDPR and India's DPDP Act, collecting and
+storing it engages obligations around lawful basis, retention and subject access
+that a production deployment would have to answer for.
+
+Consequences baked into the implementation:
+
+- Outbound requests are throttled and serialized (`MIN_REQUEST_INTERVAL=2.5`,
+  `MAX_CONCURRENT_FETCHES=2`)
+- Responses are cached for 24h, so repeat lookups never touch LinkedIn
+- Nothing is persisted beyond the cache TTL
+- No credential is read from anywhere but the environment
+
+For production I would argue for a licensed provider (Proxycurl, Bright Data, or
+LinkedIn's partner APIs) and keep the reverse-engineered path for development only.
+The adapter boundary in `app/sources/` exists so that swap is a one-file change.
+
+---
+
+## Approach
+
+### Why the private API rather than HTML parsing
+
+LinkedIn's web app is a client-side application that talks to a private REST layer
+at `/voyager/api/*`. Reading that layer directly is more robust than parsing
+rendered HTML: responses are already structured, they don't change when the
+front-end is restyled, and one call can return many sections. It is also what the
+brief asked for — a purely reverse-engineered solution that hits LinkedIn
+endpoints directly, with no browser involved.
+
+### Authentication is reverse-engineered too
+
+The service does not rely on cookies harvested from a browser session. It replays
+LinkedIn's login form against `/uas/authenticate` directly. **No browser or
+headless driver is used at any point in the pipeline.**
+
+Three steps, and the ordering matters:
+
+1. `GET /uas/authenticate` — seeds a `JSESSIONID` cookie. Posting straight to step
+   2 fails, because the CSRF value in the body has to match a session LinkedIn has
+   already issued.
+2. `POST /uas/authenticate` — form-encoded `session_key` / `session_password`, plus
+   the `JSESSIONID` value as a CSRF field.
+3. Read `li_at` from the response cookie jar.
+
+The response is JSON with a `login_result` discriminator rather than a plain status
+code, so `200` does not by itself mean success — a challenge also returns `200`.
+
+**The quoting asymmetry** is the detail that costs people hours. `JSESSIONID` is
+stored *with* surrounding quotes. The login body wants it **with** quotes; the
+`csrf-token` header on subsequent Voyager calls wants it **without**. A one-character
+mismatch produces a `403` on every request, which reads exactly like an expired
+session.
+
+Cookies are still supported as a fallback (`LINKEDIN_LI_AT` / `LINKEDIN_JSESSIONID`)
+for the case where a datacenter IP triggers a verification challenge.
+
+### Architecture
 
 ```
-recovery/
-  error_codes.py   taxonomy + hidden ground-truth parameters
-  generator.py     synthetic traffic with correlated downtime
-  triage.py        rules tier + model tier + fallback
-  tools.py         issuer health, customer history, retry, nudge
-  agent.py         decision policy, with ablation flags
-  guardrails.py    idempotency, caps, approvals, audit, kill switch
-  simulator.py     ground-truth outcome model
-  baseline.py      fixed +30m same-rail retry
-  evaluate.py      two-arm evaluation + ablation study
-api/
-  session.py       replay session backing the console
-  main.py          FastAPI endpoints
-web/
-  index.html       single-file console
+      POST /v1/profile
+             │
+             ▼
+   ┌──────────────────┐
+   │ urls.py          │  parse + validate → public identifier
+   └────────┬─────────┘
+            ▼
+   ┌──────────────────┐
+   │ cache.py         │  Redis, or in-process fallback  ──► hit ──► respond
+   └────────┬─────────┘
+            ▼ miss
+   ┌──────────────────┐
+   │ session.py       │  owns the session; re-authenticates on expiry
+   └────────┬─────────┘
+            ▼
+   ┌──────────────────┐
+   │ sources/voyager  │  throttled, session-authenticated fetch
+   └────────┬─────────┘
+            ▼
+   ┌──────────────────┐
+   │ normalize.py     │  upstream shapes → the public schema
+   └────────┬─────────┘
+            ▼
+        Profile JSON
 ```
+
+Five decisions worth calling out:
+
+**A source is an adapter, not the architecture.** `app/sources/` holds fetching
+strategy behind a narrow interface. Adding a dash-collections source or a
+commercial provider means adding a file, not restructuring the service. Given what
+happened to `profileView`, this turned out to matter more than I expected when I
+designed it.
+
+**Fetching is separate from normalizing.** `voyager.py` knows about cookies and
+HTTP; `normalize.py` knows about response shapes. This makes the mapping logic
+unit-testable against fixtures with no network access — see `tests/test_normalize.py`.
+
+**Sessions self-heal.** Cookie expiry was the biggest weakness of a cookies-only
+design: the session dies hours after submission and the whole API looks broken.
+`session.py` re-authenticates on the first `SESSION_EXPIRED` and retries once. It
+gives up permanently after a challenge, because a verification prompt will not
+clear on retry and repeated failed logins are how accounts get locked.
+
+**Partial failure degrades one section, not the request.** Supplementary calls that
+fail are recorded in `meta.unavailable_sections` rather than failing the response.
+Every accessor in `normalize.py` is defensive for the same reason.
+
+**Upstream failures are typed.** `403` → `SESSION_EXPIRED`; `429`/`999` →
+`RATE_LIMITED` with `retryable: true`; `410` → `UPSTREAM_ERROR`; unknown identifier
+→ `PROFILE_NOT_FOUND`. A caller can act on these. A generic `500` tells them nothing.
+This design is why the current upstream removal surfaces as a clean, diagnostic
+JSON error instead of a stack trace.
+
+---
+
+## Setup
+
+### 1. Install
+
+```bash
+git clone https://github.com/naman0867/linkedin-api.git
+cd linkedin-api
+python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -r requirements.txt -r requirements-dev.txt
+```
+
+### 2. Configure
+
+```bash
+cp .env.example .env
+```
+
+Preferred — credentials, so the session self-heals:
+
+```ini
+API_KEYS=pick-something-long
+LINKEDIN_EMAIL=you@example.com
+LINKEDIN_PASSWORD=your-password
+```
+
+Fallback — cookies, if programmatic login hits a challenge. From a logged-in
+browser: DevTools → Application → Cookies → `https://www.linkedin.com`.
+
+```ini
+LINKEDIN_LI_AT=AQEDAT...
+LINKEDIN_JSESSIONID="ajax:1234567890123456789"
+```
+
+Keep the quotes on `JSESSIONID`. The client strips them where needed and re-adds
+them where needed.
+
+`.env` is gitignored. No credential is read from anywhere but the environment.
+
+### 3. Run
+
+```bash
+uvicorn app.main:app --reload
+```
+
+http://localhost:8000/docs
+
+---
+
+## API documentation
+
+Profile endpoints require an `X-API-Key` header matching an entry in `API_KEYS`.
+
+### `GET /healthz`
+
+No auth. Reports session state and cache backend.
+
+```json
+{
+  "status": "ok",
+  "linkedin_session_configured": true,
+  "auth_mode": "credentials",
+  "can_self_heal": true,
+  "cache_backend": "memory"
+}
+```
+
+`auth_mode` is `credentials`, `cookies` or `none`. `can_self_heal` indicates
+whether re-authentication is available after session expiry.
+
+### `POST /v1/profile`
+
+```bash
+curl -X POST https://linkedin-profile-api-81m4.onrender.com/v1/profile \
+  -H "X-API-Key: my-long-random-key-9f3k2j" \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://www.linkedin.com/in/williamhgates/"}'
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `url` | string | required | Any member URL shape: bare, `www.`, country subdomain, with query params, or a `/details/...` sub-path |
+| `refresh` | bool | `false` | Bypass the cache and force a live fetch |
+
+### `GET /v1/profile`
+
+Same operation as a GET, for browser and plain-curl testing.
+
+```bash
+curl -G https://linkedin-profile-api-81m4.onrender.com/v1/profile \
+  -H "X-API-Key: my-long-random-key-9f3k2j" \
+  --data-urlencode "url=https://www.linkedin.com/in/williamhgates/"
+```
+
+### Errors
+
+One envelope for every failure:
+
+```json
+{ "error": { "code": "SESSION_EXPIRED", "message": "...", "retryable": false } }
+```
+
+| HTTP | `code` | Meaning |
+|---|---|---|
+| 400 | `INVALID_URL` | Not a member profile URL |
+| 401 | `UNAUTHORIZED` | Missing or unknown `X-API-Key` |
+| 404 | `PROFILE_NOT_FOUND` | No such profile, or not visible to the session account |
+| 502 | `UPSTREAM_ERROR` | Unexpected upstream response — **currently returned for all profile fetches, see [Current status](#current-status-linkedin-endpoint-migration)** |
+| 503 | `SESSION_EXPIRED` | LinkedIn rejected the session |
+| 503 | `RATE_LIMITED` | Throttled upstream; `retryable: true` |
+| 503 | `NO_SESSION` | No LinkedIn credentials configured |
+
+---
+
+## Response schema
+
+Abridged; full schema at `/docs` and in `app/schemas.py`.
+
+```json
+{
+  "public_identifier": "williamhgates",
+  "profile_url": "https://www.linkedin.com/in/williamhgates",
+  "urn": "urn:li:fs_profile:ACoAAA...",
+  "basics": {
+    "first_name": "Bill",
+    "last_name": "Gates",
+    "full_name": "Bill Gates",
+    "headline": "Co-chair, Bill & Melinda Gates Foundation",
+    "about": "...",
+    "industry": "Philanthropy",
+    "location": { "raw": "Seattle, Washington", "country": "United States" },
+    "profile_picture": [
+      { "url": "https://media.licdn.com/.../800.jpg", "width": 800, "height": 800 }
+    ]
+  },
+  "experience": [
+    {
+      "title": "Co-chair",
+      "company": { "name": "Bill & Melinda Gates Foundation", "linkedin_url": "..." },
+      "start_date": { "year": 2000, "month": 1 },
+      "end_date": null,
+      "is_current": true
+    }
+  ],
+  "education": [ ... ],
+  "skills": [ { "name": "Philanthropy", "endorsement_count": 42 } ],
+  "certifications": [ ... ],
+  "languages": [ { "name": "English", "proficiency": "NATIVE_OR_BILINGUAL" } ],
+  "projects": [ ... ],
+  "honors": [ ... ],
+  "volunteer": [ ... ],
+  "meta": {
+    "source": "voyager",
+    "fetched_at": "2026-08-31T10:15:00Z",
+    "cache_hit": false,
+    "duration_ms": 1830,
+    "unavailable_sections": []
+  }
+}
+```
+
+Three choices I'd defend:
+
+**Dates are structs, not strings.** LinkedIn routinely gives a year with no month
+and never gives a day. Serialising `{"year": 2019}` as `"2019-01-01"` invents
+precision that was never there, and every consumer then has to guess whether
+January was real. `{"year": 2019, "month": null, "day": null}` is honest.
+
+**`meta.unavailable_sections` exists** so `"skills": []` is unambiguous. An empty
+array otherwise conflates "this member listed no skills" with "we could not
+retrieve them", and those warrant different handling.
+
+**Images are arrays with dimensions.** LinkedIn serves several resolutions;
+returning all of them lets the consumer choose rather than baking in my guess.
+They are signed URLs that expire, which `expires_at` records.
+
+---
+
+## Known limitations
+
+**The profile endpoint has been retired.** `profileView` returns `410 Gone` as of
+31 August 2026. Full detail, evidence and migration path in
+[Current status](#current-status-linkedin-endpoint-migration). This is the dominant
+limitation and everything below is secondary to it.
+
+**Rate limits are undocumented and enforced silently.** LinkedIn publishes no
+thresholds. During endpoint probing, roughly 30 requests in a few minutes was
+enough to trigger soft limiting: profile endpoints began returning `302` while
+`/me` still returned `200`. There is no `Retry-After`, no error body, no signal
+other than the redirect. Conservative defaults reduce but do not eliminate this.
+
+**Visibility is account-scoped.** Voyager returns what the *authenticated member*
+can see. Second- and third-degree connections show reduced data; some profiles are
+private. The same URL can legitimately yield different output from different
+backing accounts, and a low-connection account returns substantially less.
+
+**Account provisioning is a hard constraint.** I attempted to use a separate
+account for testing and found newly created accounts are gated behind identity
+verification — government ID, multi-day review. This has an architectural
+consequence: **throughput cannot be scaled by adding accounts.** A production
+system needs licensed data access, not more sessions. This is not a detail; it
+caps the whole approach.
+
+**Programmatic login is IP-sensitive.** It succeeded from a residential
+connection. Datacenter IPs — which includes every cloud host — frequently trigger
+`CHALLENGE_REQUIRED`, which cannot be resolved without out-of-band input. This is
+why cookie fallback exists.
+
+**Session tokens are the real secret.** `li_at` is a bearer token: anyone holding
+it can act as the account without the password and without triggering 2FA. It is
+environment-only, never logged, never committed.
+
+**Not exhaustive.** Recommendations, endorsement detail, contact info, patents and
+course lists are not mapped. Contact info sits behind a separate endpoint that
+`403`s for most non-connections.
+
+**Single-session throughput.** One account, serialized requests, ~2.5s apart. Real
+throughput would need a session pool and residential proxies — and per the
+provisioning constraint above, that pool is not obtainable at scale.
+
+**Cache invalidation is time-based only.** A profile edited within the TTL serves
+stale until it expires or `refresh: true` is passed. LinkedIn provides no change
+signal.
+
+---
+
+## Testing
+
+```bash
+pytest -q
+```
+
+19 tests, no network access required.
+
+- **`test_urls.py`** — URL parsing across the shapes people actually paste: bare
+  domains, country subdomains, tracking params, `/details/` sub-paths, uppercase
+  schemes. Plus rejection of company URLs, feed URLs, and lookalike domains such
+  as `linkedin.com.evil.test`.
+- **`test_normalize.py`** — the mapping layer against recorded fixtures: image
+  artifacts reassembled largest-first, open-ended positions marked current, skills
+  deduplicated across two sources, and missing sections degrading rather than
+  raising.
+- **`test_session.py`** — re-authentication behaviour: one retry on expiry, and
+  *exactly one* login attempt after a challenge, verifying the lockout guard.
+
+Splitting fetch from transform is what makes this possible. The mapping is the part
+most likely to break when LinkedIn changes a response, so it needs to be cheap to
+test — which is also what will make the dash migration tractable.
+
+---
+
+## Deployment
+
+Live on Render's free tier via the committed `render.yaml`. Point Render at the
+repo as a Blueprint and set the environment variables in the dashboard.
+
+```bash
+docker build -t linkedin-profile-api .
+docker run -p 8000:8000 --env-file .env linkedin-profile-api
+```
+
+Two notes on the free tier: instances sleep after 15 minutes and take ~60s to wake,
+and free Key Value storage is in-memory only, so a warmed cache does not survive a
+restart. Set `REDIS_URL` on a paid tier for a cache that persists.
+
+---
+
+## What I would do next
+
+Concretely, in order:
+
+**1. Map the dash collections.** The base `dash/profiles` call returns the
+`Profile` entity and its URN. Each section is then its own endpoint —
+`identity/dash/profilePositionGroups?q=viewee&profileUrn={urn}` and siblings for
+educations, skills, certifications and languages. `scripts/probe2.py` already
+probes these; it needs a clean run outside a rate limit window.
+
+**2. Write a `dash` source adapter.** A sibling to `voyager.py` behind the same
+interface. The response is a normalized `{data, included}` graph rather than nested
+views, so `normalize.py` gains a second mapper — resolving `$type` discriminators
+and URN references across the `included` array — rather than being rewritten.
+
+**3. Add GraphQL as a third adapter.** LinkedIn is migrating toward
+`/voyager/api/graphql` with `queryId` build hashes that rotate on deploy. Pinning
+them means re-extracting after each rotation, so the durable version discovers
+them at runtime from the page bundle. `probe2.py` contains the discovery regex.
+
+**4. Harden against exactly this class of failure.** The 410 should have been
+caught by a scheduled canary rather than by a manual fetch. A daily job hitting a
+known profile, asserting non-empty core fields, and alerting on drift would turn a
+silent breakage into a notification.
+
+The architecture already anticipated this specific problem — the original
+limitations section flagged `profileView` as legacy and named the GraphQL
+migration as the risk. The adapter boundary is why the fix is additive rather than
+a rewrite. What I would change is the monitoring: I designed for the failure but
+had no way to detect it early.
