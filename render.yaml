@@ -1,0 +1,19 @@
+﻿services:
+  - type: web
+    name: linkedin-profile-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.4"
+      # Set these in the Render dashboard, never here.
+      - key: API_KEYS
+        sync: false
+      - key: LINKEDIN_LI_AT
+        sync: false
+      - key: LINKEDIN_JSESSIONID
+        sync: false
+
